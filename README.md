@@ -6,7 +6,7 @@ The application provides match statistics, pitch graphics, player comparisons, o
 
 THIS PROJECT CONTAINS A LIVE APPLICATION:
 
-[http://localhost:8501](https://match-report-tool-alohihqbw6v5ewwmta3zoa.streamlit.app/)
+[Match Report Tool](https://match-report-tool-alohihqbw6v5ewwmta3zoa.streamlit.app/)
 
 Features
 
