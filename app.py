@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from io import BytesIO
+import json
 import textwrap
 from typing import Iterable
+import xml.etree.ElementTree as ET
 
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
@@ -15,8 +17,65 @@ from statsbombpy import sb
 
 st.set_page_config(page_title="StatsBomb Coaching Report", page_icon="⚽", layout="wide")
 
-TEAM_COLOURS = {"primary": "#d71920", "secondary": "#111111"}
+TEAM_COLOUR_MAP = {}
 PITCH = Pitch(pitch_type="statsbomb", pitch_color="#2b7a3d", line_color="white")
+
+TEMPLATE_COLUMNS = [
+    "match_id", "match_date", "home_team", "away_team", "period", "minute", "second",
+    "team", "player", "jersey_number", "position", "event_type", "outcome", "recipient",
+    "x", "y", "end_x", "end_y", "xg", "possession_team", "duration", "card", "notes",
+    "home_colour", "away_colour",
+]
+
+COLUMN_ALIASES = {
+    "match_id": ["match_id", "match id", "game_id", "fixture_id"],
+    "match_date": ["match_date", "match date", "date", "game_date"],
+    "home_team": ["home_team", "home team", "home"],
+    "away_team": ["away_team", "away team", "away", "opposition", "opponent"],
+    "period": ["period", "half", "match_period"],
+    "minute": ["minute", "min", "match_minute", "start_minute", "start"],
+    "second": ["second", "sec", "match_second", "start_second"],
+    "team": ["team", "team_name", "side", "squad"],
+    "player": ["player", "player_name", "athlete", "name"],
+    "jersey_number": ["jersey_number", "shirt_number", "squad_number", "number", "no"],
+    "position": ["position", "player_position", "role"],
+    "event_type": ["event_type", "event", "type", "action", "code", "category"],
+    "outcome": ["outcome", "result", "event_outcome", "success"],
+    "recipient": ["recipient", "pass_recipient", "receiver", "target_player"],
+    "x": ["x", "start_x", "location_x", "pos_x"],
+    "y": ["y", "start_y", "location_y", "pos_y"],
+    "end_x": ["end_x", "x2", "finish_x", "target_x"],
+    "end_y": ["end_y", "y2", "finish_y", "target_y"],
+    "xg": ["xg", "expected_goals", "shot_xg"],
+    "possession_team": ["possession_team", "team_in_possession"],
+    "duration": ["duration", "event_duration", "length"],
+    "card": ["card", "card_type", "discipline"],
+    "notes": ["notes", "note", "comment", "descriptor", "label"],
+    "home_colour": ["home_colour", "home_color", "home team colour", "home team color"],
+    "away_colour": ["away_colour", "away_color", "away team colour", "away team color"],
+}
+
+EVENT_NAMES = {
+    "pass": "Pass", "shot": "Shot", "goal": "Shot", "pressure": "Pressure",
+    "press": "Pressure", "ball recovery": "Ball Recovery", "recovery": "Ball Recovery",
+    "interception": "Interception", "block": "Block", "duel": "Duel", "tackle": "Duel",
+    "foul": "Foul Committed", "foul committed": "Foul Committed",
+    "substitution": "Substitution", "sub": "Substitution", "carry": "Carry",
+    "dribble": "Dribble", "clearance": "Clearance", "offside": "Offside",
+}
+CANONICAL_EVENTS = ["Pass", "Shot", "Pressure", "Ball Recovery", "Interception", "Block", "Duel",
+                    "Foul Committed", "Substitution", "Carry", "Dribble", "Clearance", "Offside", "Unknown"]
+
+
+def canonical_event_name(value) -> str:
+    text = str(value).strip().lower()
+    if text in EVENT_NAMES:
+        return EVENT_NAMES[text]
+    simplified = text.replace("_", " ").replace("-", " ").replace(".", " ")
+    for alias, canonical in sorted(EVENT_NAMES.items(), key=lambda item: len(item[0]), reverse=True):
+        if alias in simplified:
+            return canonical
+    return str(value).strip().title() or "Unknown"
 
 
 # -----------------------------------------------------------------------------
@@ -35,6 +94,186 @@ def load_matches(competition_id: int, season_id: int) -> pd.DataFrame:
 @st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
 def load_match(match_id: int):
     return sb.events(match_id=match_id), sb.lineups(match_id=match_id)
+
+
+def custom_template() -> pd.DataFrame:
+    rows = [
+        ["MATCH-001", "2026-09-15", "Home Team", "Away Team", 1, 3, 12, "Home Team",
+         "Alex Example", 8, "Centre Midfield", "Pass", "Complete", "Sam Example",
+         42, 38, 61, 44, "", "Home Team", 1.2, "", "Delete example rows before entering your match",
+         "#138A36", "#1F3A5F"],
+        ["MATCH-001", "2026-09-15", "Home Team", "Away Team", 1, 8, 25, "Away Team",
+         "Taylor Example", 9, "Striker", "Shot", "Saved", "", 104, 36, "", "", 0.18,
+         "Away Team", 0.8, "", "", "#138A36", "#1F3A5F"],
+        ["MATCH-001", "2026-09-15", "Home Team", "Away Team", 1, 19, 4, "Home Team",
+         "Jordan Example", 4, "Centre Back", "Interception", "Won", "", 67, 52, "", "", "",
+         "Away Team", 0.0, "", "", "#138A36", "#1F3A5F"],
+    ]
+    return pd.DataFrame(rows, columns=TEMPLATE_COLUMNS)
+
+
+def template_dictionary() -> pd.DataFrame:
+    required = {"minute", "team", "event_type"}
+    descriptions = {
+        "period": "1 or 2 (extra-time periods may use 3 or 4)",
+        "minute": "Elapsed match minute as a number",
+        "second": "Seconds within the minute, 0–59",
+        "event_type": "Pass, Shot, Pressure, Recovery, Interception, Duel, Foul, Substitution, etc.",
+        "outcome": "Complete/Incomplete for passes; Goal/Saved/Off Target/etc. for shots",
+        "x": "Event start, scaled 0–120 from own goal to opposition goal",
+        "y": "Event start, scaled 0–80 from left touchline to right touchline",
+        "end_x": "Event end x-coordinate, primarily for passes and carries",
+        "end_y": "Event end y-coordinate",
+        "xg": "Expected-goals value for a shot, normally between 0 and 1",
+        "duration": "Event duration in seconds",
+        "home_colour": "Optional home-team colour as a hex code, for example #138A36",
+        "away_colour": "Optional away-team colour as a hex code, for example #1F3A5F",
+    }
+    return pd.DataFrame({
+        "field": TEMPLATE_COLUMNS,
+        "required": ["Yes" if field in required else "No" for field in TEMPLATE_COLUMNS],
+        "description": [descriptions.get(field, field.replace("_", " ").title()) for field in TEMPLATE_COLUMNS],
+    })
+
+
+def read_uploaded_file(uploaded_file) -> pd.DataFrame:
+    name = uploaded_file.name.lower()
+    payload = uploaded_file.getvalue()
+    if name.endswith(".csv") or name.endswith(".tsv"):
+        separator = "\t" if name.endswith(".tsv") else None
+        return pd.read_csv(BytesIO(payload), sep=separator, engine="python")
+    if name.endswith((".xlsx", ".xls")):
+        return pd.read_excel(BytesIO(payload))
+    if name.endswith(".json"):
+        parsed = json.loads(payload.decode("utf-8-sig"))
+        if isinstance(parsed, dict):
+            for key in ["events", "data", "rows", "instances"]:
+                if isinstance(parsed.get(key), list):
+                    parsed = parsed[key]
+                    break
+        return pd.json_normalize(parsed)
+    if name.endswith(".xml"):
+        root = ET.fromstring(payload)
+        rows = []
+        for instance in root.findall(".//instance"):
+            row = {
+                "event_type": instance.findtext("code") or instance.findtext("name"),
+                "start": instance.findtext("start"),
+                "end": instance.findtext("end"),
+            }
+            labels = []
+            for label in instance.findall(".//label"):
+                group, value = label.findtext("group"), label.findtext("text")
+                if group and value:
+                    row[group] = value
+                    labels.append(f"{group}: {value}")
+            row["notes"] = "; ".join(labels)
+            rows.append(row)
+        if not rows:
+            raise ValueError("No <instance> event records were found in the XML file.")
+        return pd.DataFrame(rows)
+    raise ValueError("Supported uploads are CSV, TSV, Excel, JSON and Sportscode-style XML.")
+
+
+def guess_mapping(columns: Iterable[str]) -> dict[str, str | None]:
+    columns = list(columns)
+    normalised = {str(column).strip().lower().replace("-", "_"): column for column in columns}
+    mapping = {}
+    for field, aliases in COLUMN_ALIASES.items():
+        match = None
+        for alias in aliases:
+            key = alias.strip().lower().replace("-", "_")
+            if key in normalised:
+                match = normalised[key]
+                break
+        mapping[field] = match
+    return mapping
+
+
+def column_values(raw: pd.DataFrame, mapping: dict, field: str, default=np.nan) -> pd.Series:
+    column = mapping.get(field)
+    return raw[column] if column in raw.columns else pd.Series(default, index=raw.index)
+
+
+def valid_hex_colour(value, fallback: str) -> str:
+    text = str(value).strip()
+    if len(text) == 7 and text.startswith("#"):
+        try:
+            int(text[1:], 16)
+            return text.upper()
+        except ValueError:
+            pass
+    return fallback
+
+
+def scale_coordinates(values: pd.Series, axis: str, system: str) -> pd.Series:
+    numeric = pd.to_numeric(values, errors="coerce")
+    if system == "0–1":
+        return numeric * (120 if axis == "x" else 80)
+    if system == "0–100":
+        return numeric * (1.2 if axis == "x" else .8)
+    return numeric
+
+
+def normalise_uploaded_events(raw: pd.DataFrame, mapping: dict, coordinate_system: str,
+                              home_team: str, away_team: str, flip_away: bool,
+                              event_value_map: dict | None = None) -> pd.DataFrame:
+    events = pd.DataFrame(index=raw.index)
+    events["id"] = [f"upload-{index}" for index in range(len(raw))]
+    events["index"] = np.arange(len(raw))
+    events["minute"] = pd.to_numeric(column_values(raw, mapping, "minute"), errors="coerce")
+    if events.minute.isna().all() and mapping.get("minute"):
+        events["minute"] = pd.to_numeric(column_values(raw, mapping, "minute"), errors="coerce") / 60
+    events["minute"] = events.minute.fillna(0).astype(int)
+    events["second"] = pd.to_numeric(column_values(raw, mapping, "second", 0), errors="coerce").fillna(0).astype(int)
+    events["period"] = pd.to_numeric(column_values(raw, mapping, "period", 1), errors="coerce").fillna(1).astype(int)
+    events["team"] = column_values(raw, mapping, "team", home_team).fillna(home_team).astype(str).str.strip()
+    events["player"] = column_values(raw, mapping, "player")
+    events["pass_recipient"] = column_values(raw, mapping, "recipient")
+    raw_types = column_values(raw, mapping, "event_type", "Unknown").fillna("Unknown").astype(str).str.strip()
+    events["type"] = raw_types.map(lambda value: (event_value_map or {}).get(value, canonical_event_name(value)))
+    events["substitution_replacement"] = column_values(raw, mapping, "recipient").where(events.type.eq("Substitution"))
+    outcome = column_values(raw, mapping, "outcome").astype("object")
+    complete_terms = {"complete", "completed", "successful", "success", "won", "true", "1", "nan"}
+    events["pass_outcome"] = outcome.where(~outcome.astype(str).str.lower().isin(complete_terms), np.nan)
+    events["shot_outcome"] = outcome.astype(str).str.title().replace("Nan", np.nan)
+    goal_rows = raw_types.str.lower().eq("goal")
+    events.loc[goal_rows, "shot_outcome"] = "Goal"
+    events["shot_statsbomb_xg"] = pd.to_numeric(column_values(raw, mapping, "xg", 0), errors="coerce").fillna(0)
+    events["possession_team"] = column_values(raw, mapping, "possession_team")
+    events["possession_team"] = events.possession_team.fillna(events.team)
+    events["possession"] = events.team.ne(events.team.shift()).cumsum()
+    events["duration"] = pd.to_numeric(column_values(raw, mapping, "duration", 0), errors="coerce").fillna(0)
+    events["bad_behaviour_card"] = column_values(raw, mapping, "card")
+    events["foul_committed_card"] = column_values(raw, mapping, "card").where(events.type.eq("Foul Committed"))
+    events["notes"] = column_values(raw, mapping, "notes")
+    for field, axis in [("x", "x"), ("y", "y"), ("end_x", "x"), ("end_y", "y")]:
+        events[field] = scale_coordinates(column_values(raw, mapping, field), axis, coordinate_system)
+    if flip_away:
+        away = events.team.eq(away_team)
+        events.loc[away, "x"] = 120 - events.loc[away, "x"]
+        events.loc[away, "y"] = 80 - events.loc[away, "y"]
+        events.loc[away, "end_x"] = 120 - events.loc[away, "end_x"]
+        events.loc[away, "end_y"] = 80 - events.loc[away, "end_y"]
+    events["location"] = events.apply(lambda row: [row.x, row.y] if pd.notna(row.x) and pd.notna(row.y) else np.nan, axis=1)
+    events["pass_end_location"] = events.apply(
+        lambda row: [row.end_x, row.end_y] if pd.notna(row.end_x) and pd.notna(row.end_y) else np.nan, axis=1)
+    return events
+
+
+def uploaded_lineups(raw: pd.DataFrame, mapping: dict, teams: list[str]) -> dict[str, pd.DataFrame]:
+    frames = {}
+    for team in teams:
+        mask = column_values(raw, mapping, "team", team).astype(str).str.strip().eq(team)
+        frame = pd.DataFrame({
+            "player_name": column_values(raw, mapping, "player")[mask],
+            "jersey_number": pd.to_numeric(column_values(raw, mapping, "jersey_number")[mask], errors="coerce"),
+            "position_name": column_values(raw, mapping, "position")[mask],
+        }).dropna(subset=["player_name"]).drop_duplicates("player_name")
+        frame["positions"] = frame.position_name.apply(
+            lambda value: [{"position": value if pd.notna(value) else "—", "start_reason": "Starting XI", "from": "00:00:00"}])
+        frames[team] = frame.drop(columns="position_name").reset_index(drop=True)
+    return frames
 
 
 def series_or_default(df: pd.DataFrame, column: str, default=np.nan) -> pd.Series:
@@ -59,7 +298,12 @@ def add_xy(df: pd.DataFrame, source="location", prefix="") -> pd.DataFrame:
 
 
 def format_table(df: pd.DataFrame, hide_index: bool = False):
-    renamed = df.rename(columns=lambda value: str(value).replace("_", " ").title())
+    display = df.copy()
+    if display.index.name:
+        display = display.reset_index()
+    else:
+        display = display.reset_index(drop=True)
+    renamed = display.rename(columns=lambda value: str(value).replace("_", " ").title())
     formats = {}
     for column in renamed.columns:
         if pd.api.types.is_float_dtype(renamed[column]):
@@ -70,7 +314,7 @@ def format_table(df: pd.DataFrame, hide_index: bool = False):
         .set_properties(**{"text-align": "center"})
         .set_table_styles([{"selector": "th", "props": [("text-align", "center")]}])
     )
-    return styled.hide(axis="index") if hide_index else styled
+    return styled.hide(axis="index")
 
 
 def csv_bytes(df: pd.DataFrame) -> bytes:
@@ -266,7 +510,7 @@ def player_summary(events: pd.DataFrame, team: str) -> pd.DataFrame:
 def shot_map(shots: pd.DataFrame, teams: list[str]):
     shots = add_xy(shots).dropna(subset=["x", "y"])
     fig, ax = PITCH.draw(figsize=(12, 7))
-    colours = [TEAM_COLOURS["primary"], TEAM_COLOURS["secondary"]]
+    colours = [TEAM_COLOUR_MAP.get(team, fallback) for team, fallback in zip(teams, ["#d71920", "#111111"])]
     for team, colour in zip(teams, colours):
         team_shots = shots[series_or_default(shots, "team").eq(team)]
         xg = pd.to_numeric(series_or_default(team_shots, "shot_statsbomb_xg", 0.05), errors="coerce").fillna(0.05)
@@ -286,7 +530,7 @@ def shot_map(shots: pd.DataFrame, teams: list[str]):
 
 def xg_timeline(shots: pd.DataFrame, teams: list[str]):
     fig, ax = plt.subplots(figsize=(12, 4.5))
-    colours = [TEAM_COLOURS["primary"], TEAM_COLOURS["secondary"]]
+    colours = [TEAM_COLOUR_MAP.get(team, fallback) for team, fallback in zip(teams, ["#d71920", "#111111"])]
     for team, colour in zip(teams, colours):
         team_shots = shots[series_or_default(shots, "team").eq(team)].sort_values("minute")
         minutes = pd.to_numeric(series_or_default(team_shots, "minute", 0), errors="coerce").fillna(0)
@@ -309,7 +553,7 @@ def average_positions(events: pd.DataFrame, team: str, lineups: dict):
         positions["number"] = np.nan
     fig, ax = PITCH.draw(figsize=(10, 7))
     PITCH.scatter(positions.x, positions.y, s=np.clip(positions.actions * 12, 250, 750),
-                  color=TEAM_COLOURS["primary"], edgecolors="white", ax=ax)
+                  color=TEAM_COLOUR_MAP.get(team, "#d71920"), edgecolors="white", ax=ax)
     for player, row in positions.iterrows():
         label = str(int(row.number)) if pd.notna(row.number) else str(player).split()[-1][:3]
         ax.annotate(label, (row.x, row.y), ha="center", va="center", color="white", weight="bold")
@@ -335,7 +579,7 @@ def pass_network(events: pd.DataFrame, team: str, lineups: dict, minimum: int):
                     color="#f2d338", alpha=.25 + min(row.passes / 25, .6),
                     linewidth=min(.6 + row.passes / 4, 6), zorder=1)
     PITCH.scatter(positions.x, positions.y, s=np.clip(positions.touches * 10, 250, 700),
-                  color=TEAM_COLOURS["primary"], edgecolors="white", ax=ax, zorder=2)
+                  color=TEAM_COLOUR_MAP.get(team, "#d71920"), edgecolors="white", ax=ax, zorder=2)
     for player, row in positions.iterrows():
         number = number_map.get(player, np.nan)
         label = str(int(number)) if pd.notna(number) else str(player).split()[-1][:3]
@@ -446,8 +690,127 @@ def comparative_coaching_summary(events: pd.DataFrame, teams: list[str]) -> pd.D
     return summary
 
 
+def generated_match_analysis(events: pd.DataFrame, team: str, opponent: str,
+                             length: str = "Standard", focus: str = "Complete") -> dict[str, str]:
+    teams = [team, opponent]
+    summary = team_summary(events, teams)
+    own, other = summary.loc[team], summary.loc[opponent]
+    own_pass, other_pass = pass_metrics(events, team), pass_metrics(events, opponent)
+    own_shots = events[series_or_default(events, "type").eq("Shot") & series_or_default(events, "team").eq(team)]
+    other_shots = events[series_or_default(events, "type").eq("Shot") & series_or_default(events, "team").eq(opponent)]
+    own_xg_shot = float(own.xG / own.shots) if own.shots else 0
+    other_xg_shot = float(other.xG / other.shots) if other.shots else 0
+    passes = add_xy(add_xy(completed_passes(events, team), "pass_end_location", "end_")).dropna(subset=["x", "y"])
+    entries = passes[(passes.x < 80) & (passes.end_x >= 80)]
+    left = int((entries.end_y < 26.7).sum())
+    centre = int(entries.end_y.between(26.7, 53.3).sum())
+    right = int((entries.end_y > 53.3).sum())
+    channel_counts = {"left": left, "central": centre, "right": right}
+    main_channel = max(channel_counts, key=channel_counts.get) if entries.shape[0] else "no clear"
+    own_pressures, other_pressures = count_type(events, "Pressure", team), count_type(events, "Pressure", opponent)
+    own_recoveries, other_recoveries = count_type(events, "Ball Recovery", team), count_type(events, "Ball Recovery", opponent)
+    high_recoveries = add_xy(events[series_or_default(events, "team").eq(team) &
+                                    series_or_default(events, "type").eq("Ball Recovery")])
+    high_recovery_count = int((high_recoveries.x >= 80).sum())
+    player_stats = player_summary(events, team)
+
+    if own.xG > other.xG + .4:
+        balance = f"{team} created the stronger chances"
+    elif other.xG > own.xG + .4:
+        balance = f"{opponent} created the stronger chances"
+    else:
+        balance = "chance quality was relatively even"
+    sections = {
+        "Match summary": (
+            f"{balance}. {team} recorded {int(own.shots)} shots and {own.xG:.2f} xG, compared with "
+            f"{int(other.shots)} shots and {other.xG:.2f} xG for {opponent}. The possession estimate was "
+            f"{own['possession estimate %']:.1f}% for {team}."
+        ),
+        "In possession": (
+            f"{team} completed {own_pass['pass completion %']:.1f}% of attempted passes, including "
+            f"{own_pass['progressive passes']} progressive passes, {own_pass['final-third entries']} final-third "
+            f"entries and {own_pass['penalty-area entries']} penalty-area entries. The {main_channel} channel was "
+            f"used most often for recorded final-third entries ({left} left, {centre} central and {right} right)."
+        ),
+        "Out of possession": (
+            f"The data records {own_pressures} pressures, {own_recoveries} ball recoveries and "
+            f"{count_type(events, 'Interception', team)} interceptions for {team}. {high_recovery_count} recoveries "
+            f"occurred in the attacking third. {opponent} recorded {other_pressures} pressures and "
+            f"{other_recoveries} recoveries over the same period."
+        ),
+        "Transitions": (
+            f"{team}'s progression produced {own_pass['final-third entries']} completed entries into the final third "
+            f"and {own_pass['penalty-area entries']} entries into the penalty area. The {high_recovery_count} "
+            f"attacking-third recoveries provide the clearest event-data indicator of opportunities to attack "
+            f"immediately after regaining possession."
+        ),
+    }
+
+    first_half = events[pd.to_numeric(series_or_default(events, "minute", 0), errors="coerce") <= 45]
+    second_half = events[pd.to_numeric(series_or_default(events, "minute", 0), errors="coerce") > 45]
+    first = team_summary(first_half, teams).loc[team]
+    second = team_summary(second_half, teams).loc[team]
+    sections["Key periods"] = (
+        f"{team} produced {int(first.shots)} shots and {first.xG:.2f} xG in the first half, followed by "
+        f"{int(second.shots)} shots and {second.xG:.2f} xG in the second half. Pass completion changed from "
+        f"{first['pass completion %']:.1f}% to {second['pass completion %']:.1f}%."
+    )
+    if not player_stats.empty:
+        involved = player_stats.iloc[0]
+        shooter = player_stats.sort_values("xG", ascending=False).iloc[0]
+        defender = player_stats.assign(defensive=player_stats.pressures + player_stats.recoveries +
+                                       player_stats.interceptions).sort_values("defensive", ascending=False).iloc[0]
+        sections["Player observations"] = (
+            f"{involved.player} had the highest recorded event involvement ({int(involved['touch events'])} events). "
+            f"{shooter.player} generated the highest individual xG ({shooter.xG:.2f}), while {defender.player} "
+            f"recorded the most combined pressures, recoveries and interceptions ({int(defender.defensive)})."
+        )
+    strengths = []
+    priorities = []
+    training = []
+    if own.xG >= other.xG:
+        strengths.append(f"chance creation ({own.xG:.2f} xG versus {other.xG:.2f})")
+    else:
+        priorities.append(f"restricting opponent chance quality ({other.xG:.2f} xG conceded)")
+    if own_pass["final-third entries"] > other_pass["final-third entries"]:
+        strengths.append(f"progression into the final third ({own_pass['final-third entries']} entries)")
+    else:
+        priorities.append(f"progression into the final third ({own_pass['final-third entries']} entries)")
+    if own_xg_shot < .09 and len(own_shots) >= 5:
+        priorities.append(f"shot selection ({own_xg_shot:.2f} xG per shot)")
+        training.append("use conditioned finishing practices that reward central shots and an extra pass before low-quality attempts")
+    if own_pass["penalty-area entries"] < max(4, own_pass["final-third entries"] * .3):
+        priorities.append("turning final-third possession into penalty-area entries")
+        training.append("rehearse wide and central combinations that finish with multiple players occupying the penalty area")
+    if high_recovery_count >= 4:
+        strengths.append(f"attacking-third recoveries ({high_recovery_count})")
+    else:
+        training.append("train the first five seconds after possession is lost, with clear pressure, cover and recovery roles")
+    sections["Strengths"] = "The clearest data-supported strengths were " + "; ".join(strengths[:3]) + "." if strengths else "No single strength met the report thresholds in the selected period."
+    sections["Development priorities"] = "Priority areas are " + "; ".join(priorities[:3]) + "." if priorities else "No major development priority met the report thresholds in the selected period."
+    sections["Training recommendations"] = "Recommended next steps are to " + "; and ".join(training[:3]) + "." if training else "Maintain the current themes and use video to confirm the off-ball detail behind the positive indicators."
+
+    focus_sections = {
+        "In possession": {"Match summary", "In possession", "Transitions", "Player observations", "Strengths", "Development priorities", "Training recommendations"},
+        "Out of possession": {"Match summary", "Out of possession", "Transitions", "Player observations", "Strengths", "Development priorities", "Training recommendations"},
+        "Transitions": {"Match summary", "Transitions", "Key periods", "Strengths", "Development priorities", "Training recommendations"},
+    }
+    if focus != "Complete":
+        sections = {key: value for key, value in sections.items() if key in focus_sections[focus]}
+    if length == "Brief":
+        keep = ["Match summary", "Strengths", "Development priorities", "Training recommendations"]
+        sections = {key: sections[key] for key in keep if key in sections}
+    elif length == "Detailed":
+        sections["Data context"] = (
+            f"The selected sample contains {len(events)} events and {len(own_shots) + len(other_shots)} shots. "
+            f"It includes {own_pass['passes attempted']} pass attempts by {team} and "
+            f"{other_pass['passes attempted']} by {opponent}."
+        )
+    return sections
+
+
 def make_pdf_report(match_title: str, period: tuple[int, int], summary: pd.DataFrame,
-                    team_notes: dict[str, list[str]], coach_fields: dict[str, str],
+                    team_notes: dict[str, list[str]], coach_fields: dict,
                     figures: list[tuple[str, object]]) -> bytes:
     output = BytesIO()
     with PdfPages(output) as pdf:
@@ -485,6 +848,22 @@ def make_pdf_report(match_title: str, period: tuple[int, int], summary: pd.DataF
                 y -= .018 * len(wrapped) + .008
         pdf.savefig(fig, bbox_inches="tight")
         plt.close(fig)
+        generated_sections = coach_fields.get("generated_sections", {})
+        section_items = list(generated_sections.items())
+        for page_start in range(0, len(section_items), 4):
+            analysis_page = plt.figure(figsize=(8.27, 11.69))
+            analysis_page.patch.set_facecolor("white")
+            analysis_page.text(.07, .95, "GENERATED MATCH ANALYSIS", fontsize=18, weight="bold", color="#b54749")
+            analysis_page.text(.07, .92, match_title, fontsize=11, weight="bold")
+            y = .87
+            for heading, content in section_items[page_start:page_start + 4]:
+                analysis_page.text(.07, y, heading, fontsize=12, weight="bold", color="#263746")
+                y -= .03
+                wrapped = textwrap.wrap(str(content), 100)
+                analysis_page.text(.08, y, "\n".join(wrapped), fontsize=9, va="top", linespacing=1.4)
+                y -= max(.12, .021 * len(wrapped) + .065)
+            pdf.savefig(analysis_page, bbox_inches="tight")
+            plt.close(analysis_page)
         for title, chart in figures:
             chart.suptitle(title, fontsize=14, weight="bold")
             pdf.savefig(chart, bbox_inches="tight")
@@ -496,50 +875,167 @@ def make_pdf_report(match_title: str, period: tuple[int, int], summary: pd.DataF
 # -----------------------------------------------------------------------------
 # Interface
 # -----------------------------------------------------------------------------
-st.title("⚽ StatsBomb Coaching Report")
-st.caption("Interactive match analysis using StatsBomb open event data")
-
-try:
-    competitions = load_competitions()
-except Exception as exc:
-    st.error(f"StatsBomb competitions could not be loaded: {exc}")
-    st.stop()
+st.title("⚽ Football Coaching Report")
+st.caption("Analyse StatsBomb open data or upload event data from another source")
 
 with st.sidebar:
-    st.header("Match selection")
-    competition_name = st.selectbox("Competition", sorted(competitions.competition_name.unique()))
-    competition_rows = competitions[competitions.competition_name.eq(competition_name)]
-    season_name = st.selectbox("Season", sorted(competition_rows.season_name.unique(), reverse=True))
-    selected_row = competition_rows[competition_rows.season_name.eq(season_name)].iloc[0]
+    st.header("Data source")
+    source_mode = st.radio("Choose source", ["StatsBomb open data", "Upload match data"])
+
+source_is_statsbomb = source_mode == "StatsBomb open data"
+
+if source_is_statsbomb:
     try:
-        matches = load_matches(int(selected_row.competition_id), int(selected_row.season_id)).copy()
+        competitions = load_competitions()
     except Exception as exc:
-        st.error(f"Matches could not be loaded: {exc}")
+        st.error(f"StatsBomb competitions could not be loaded: {exc}")
         st.stop()
-    matches["label"] = (matches.home_team + " vs " + matches.away_team + " · " +
-                        matches.match_date.astype(str))
-    selected_label = st.selectbox("Match", matches.label.tolist())
-    chosen_match = matches[matches.label.eq(selected_label)].iloc[0]
-    if st.button("Generate report", type="primary", use_container_width=True):
-        st.session_state.report_match_id = int(chosen_match.match_id)
-
-if "report_match_id" not in st.session_state:
-    st.info("Choose a competition, season and match, then select **Generate report**.")
-    st.stop()
-
-match_id = st.session_state.report_match_id
-stored = matches[matches.match_id.eq(match_id)]
-if stored.empty:
-    st.warning("The selected competition or season changed. Generate the report again.")
-    st.stop()
-match = stored.iloc[0]
-
-try:
-    with st.spinner("Loading match events and line-ups…"):
-        all_events, lineups = load_match(match_id)
-except Exception as exc:
-    st.error(f"This match could not be loaded: {exc}")
-    st.stop()
+    with st.sidebar:
+        st.header("Match selection")
+        competition_name = st.selectbox("Competition", sorted(competitions.competition_name.unique()))
+        competition_rows = competitions[competitions.competition_name.eq(competition_name)]
+        season_name = st.selectbox("Season", sorted(competition_rows.season_name.unique(), reverse=True))
+        selected_row = competition_rows[competition_rows.season_name.eq(season_name)].iloc[0]
+        try:
+            matches = load_matches(int(selected_row.competition_id), int(selected_row.season_id)).copy()
+        except Exception as exc:
+            st.error(f"Matches could not be loaded: {exc}")
+            st.stop()
+        matches["label"] = matches.home_team + " vs " + matches.away_team + " · " + matches.match_date.astype(str)
+        selected_label = st.selectbox("Match", matches.label.tolist())
+        chosen_match = matches[matches.label.eq(selected_label)].iloc[0]
+        if st.button("Generate report", type="primary", use_container_width=True):
+            st.session_state.report_match_id = int(chosen_match.match_id)
+    if "report_match_id" not in st.session_state:
+        st.info("Choose a competition, season and match, then select **Generate report**.")
+        st.stop()
+    match_id = st.session_state.report_match_id
+    stored = matches[matches.match_id.eq(match_id)]
+    if stored.empty:
+        st.warning("The selected competition or season changed. Generate the report again.")
+        st.stop()
+    match = stored.iloc[0]
+    try:
+        with st.spinner("Loading match events and line-ups…"):
+            all_events, lineups = load_match(match_id)
+    except Exception as exc:
+        st.error(f"This match could not be loaded: {exc}")
+        st.stop()
+    home_colour_default, away_colour_default = "#D71920", "#1F2933"
+else:
+    st.subheader("Upload match event data")
+    t1, t2 = st.columns(2)
+    with t1:
+        st.download_button("Download team event template", custom_template().to_csv(index=False).encode("utf-8"),
+                           "football_event_template.csv", "text/csv")
+    with t2:
+        st.download_button("Download template field guide", template_dictionary().to_csv(index=False).encode("utf-8"),
+                           "football_event_template_field_guide.csv", "text/csv")
+    st.caption("The template contains three examples. Delete those rows before recording a real match.")
+    uploaded = st.file_uploader("Upload CSV, TSV, Excel, JSON or XML", type=["csv", "tsv", "xlsx", "xls", "json", "xml"])
+    if uploaded is None:
+        st.info("Upload an event file or download the template to begin.")
+        st.stop()
+    try:
+        raw_upload = read_uploaded_file(uploaded)
+    except Exception as exc:
+        st.error(f"The file could not be read: {exc}")
+        st.stop()
+    if raw_upload.empty:
+        st.error("The uploaded file contains no rows.")
+        st.stop()
+    st.markdown("#### Upload preview")
+    st.table(format_table(raw_upload.head(8), hide_index=True))
+    guessed = guess_mapping(raw_upload.columns)
+    st.markdown("#### Match data setup")
+    options = ["— Not supplied —"] + list(raw_upload.columns)
+    mapping = {}
+    automatically_mapped = sum(value is not None for value in guessed.values())
+    required_unmapped = [field for field in ["minute", "team", "event_type"] if not guessed.get(field)]
+    if required_unmapped:
+        st.warning("Some essential fields need your attention: " + ", ".join(required_unmapped))
+    else:
+        st.success(f"File recognised. {automatically_mapped} fields matched automatically.")
+    with st.expander("Review or change field mapping", expanded=bool(required_unmapped)):
+        st.caption("Only change these selections if a column has been matched incorrectly.")
+        map_columns = st.columns(3)
+        for index, field in enumerate(TEMPLATE_COLUMNS):
+            default_column = guessed.get(field)
+            default_index = options.index(default_column) if default_column in options else 0
+            selected = map_columns[index % 3].selectbox(field.replace("_", " ").title(), options,
+                                                        index=default_index, key=f"map_{field}")
+            mapping[field] = None if selected.startswith("—") else selected
+    missing = [field for field in ["minute", "team", "event_type"] if not mapping.get(field)]
+    if missing:
+        st.warning("The file can be displayed, but event analysis needs mappings for: " + ", ".join(missing))
+        st.table(format_table(raw_upload, hide_index=True))
+        st.download_button("Download displayed data", raw_upload.to_csv(index=False).encode("utf-8"),
+                           "uploaded_data.csv", "text/csv")
+        st.stop()
+    raw_event_values = column_values(raw_upload, mapping, "event_type").dropna().astype(str).str.strip().unique().tolist()
+    event_value_map = {}
+    recognised_event_count = sum(canonical_event_name(value) in CANONICAL_EVENTS and
+                                 canonical_event_name(value) != "Unknown" for value in raw_event_values)
+    if recognised_event_count == len(raw_event_values):
+        st.success(f"All {len(raw_event_values)} event labels recognised.")
+    else:
+        st.warning(f"{len(raw_event_values) - recognised_event_count} event labels need checking.")
+    with st.expander("Review or change event names", expanded=recognised_event_count != len(raw_event_values)):
+        st.caption("Only change these selections if your software uses a custom tag or an event was interpreted incorrectly.")
+        if len(raw_event_values) > 60:
+            st.warning("Only the first 60 distinct event labels are shown. Consolidate highly variable labels before upload.")
+        event_columns = st.columns(3)
+        for index, raw_value in enumerate(raw_event_values[:60]):
+            guessed_event = canonical_event_name(raw_value)
+            event_options = CANONICAL_EVENTS + ([guessed_event] if guessed_event not in CANONICAL_EVENTS else [])
+            selected_event = event_columns[index % 3].selectbox(
+                raw_value, event_options, index=event_options.index(guessed_event), key=f"event_map_{index}_{raw_value}")
+            event_value_map[raw_value] = selected_event
+    team_values = column_values(raw_upload, mapping, "team").dropna().astype(str).str.strip().unique().tolist()
+    home_default = team_values[0] if team_values else "Home Team"
+    mapped_away = column_values(raw_upload, mapping, "away_team").dropna().astype(str).str.strip().unique().tolist()
+    away_default = team_values[1] if len(team_values) > 1 else (mapped_away[0] if mapped_away else "Away Team")
+    m1, m2, m3 = st.columns(3)
+    home_team = m1.text_input("Home team", home_default)
+    away_team = m2.text_input("Away team", away_default)
+    match_date = m3.text_input("Match date", str(column_values(raw_upload, mapping, "match_date", "Unknown").iloc[0]))
+    c1, c2, c3 = st.columns(3)
+    coordinate_system = c1.selectbox("Coordinate system", ["120×80", "0–100", "0–1"])
+    time_unit = c2.selectbox("Time field unit", ["Minutes", "Seconds"])
+    orientation = c3.selectbox("Coordinate orientation", ["Each team attacks left to right", "Single fixed pitch direction"])
+    mapping_for_import = dict(mapping)
+    import_raw = raw_upload.copy()
+    if time_unit == "Seconds":
+        minute_source = mapping.get("minute")
+        import_raw["_converted_minute"] = pd.to_numeric(import_raw[minute_source], errors="coerce") / 60
+        mapping_for_import["minute"] = "_converted_minute"
+    try:
+        all_events = normalise_uploaded_events(import_raw, mapping_for_import, coordinate_system,
+                                                home_team, away_team, orientation == "Single fixed pitch direction",
+                                                event_value_map)
+    except Exception as exc:
+        st.error(f"The mapped data could not be normalised: {exc}")
+        st.stop()
+    lineups = uploaded_lineups(raw_upload, mapping, [home_team, away_team])
+    home_score = int((all_events.team.eq(home_team) & all_events.type.eq("Shot") &
+                      all_events.shot_outcome.eq("Goal")).sum())
+    away_score = int((all_events.team.eq(away_team) & all_events.type.eq("Shot") &
+                      all_events.shot_outcome.eq("Goal")).sum())
+    match_id = f"upload_{uploaded.name.rsplit('.', 1)[0]}"
+    selected_label = f"{home_team} vs {away_team} · {match_date}"
+    match = pd.Series({"match_id": match_id, "match_date": match_date, "home_team": home_team,
+                       "away_team": away_team, "home_score": home_score, "away_score": away_score})
+    matches = pd.DataFrame([{**match.to_dict(), "label": selected_label}])
+    home_colour_default = valid_hex_colour(column_values(raw_upload, mapping, "home_colour", "#D71920").iloc[0], "#D71920")
+    away_colour_default = valid_hex_colour(column_values(raw_upload, mapping, "away_colour", "#1F2933").iloc[0], "#1F2933")
+    with st.expander("Import validation"):
+        valid_locations = int(all_events.location.notna().sum())
+        st.write(f"Rows imported: **{len(all_events)}**")
+        st.write(f"Rows with pitch coordinates: **{valid_locations}**")
+        st.write(f"Recognised event types: **{all_events.type.nunique()}**")
+        unknown = int(all_events.type.eq("Unknown").sum())
+        if unknown:
+            st.warning(f"{unknown} rows have no recognised event type.")
 
 home_team, away_team = match.home_team, match.away_team
 teams = [home_team, away_team]
@@ -548,6 +1044,11 @@ end_minute = match_end_minute(all_events)
 with st.sidebar:
     st.divider()
     st.header("Analysis filters")
+    with st.expander("Team colours", expanded=False):
+        home_colour = st.color_picker(home_team, home_colour_default, key=f"colour_home_{home_team}")
+        away_colour = st.color_picker(away_team, away_colour_default, key=f"colour_away_{away_team}")
+    TEAM_COLOUR_MAP.clear()
+    TEAM_COLOUR_MAP.update({home_team: home_colour, away_team: away_colour})
     focus_team = st.radio("Team to analyse", teams)
     first_goal_values = pd.to_numeric(all_events[
         series_or_default(all_events, "type").eq("Shot") &
@@ -612,7 +1113,7 @@ m5.metric("Pass completion", f"{focus['pass completion %']:.1f}%")
 st.caption("Possession is an event-duration estimate, not StatsBomb's official possession statistic.")
 
 tabs = st.tabs(["Overview", "Attacking", "Possession", "Defending", "Players", "Timeline",
-                "Opponent", "Match comparison", "Coaching summary", "Report builder"])
+                "Opponent", "Match comparison", "Coaching summary", "Report builder", "Event data"])
 
 with tabs[0]:
     st.subheader("Match overview")
@@ -698,6 +1199,7 @@ with tabs[4]:
                                             default=stats.player.tolist()[:2], max_selections=2)
         if comparison_players:
             compared = stats[stats.player.isin(comparison_players)].set_index("player").T
+            compared.index.name = "Statistic"
             st.table(format_table(compared))
 
 with tabs[5]:
@@ -792,13 +1294,39 @@ with tabs[8]:
 
 with tabs[9]:
     st.subheader("Build coaching report")
-    st.caption("Add your coaching judgement to the selected match data, then prepare a PDF.")
     report_team = st.selectbox("Report team", teams, index=teams.index(focus_team), key="report_team")
+    report_opponent = away_team if report_team == home_team else home_team
+    generate_col1, generate_col2 = st.columns(2)
+    analysis_length = generate_col1.selectbox("Analysis length", ["Brief", "Standard", "Detailed"], index=1)
+    analysis_focus = generate_col2.selectbox("Coaching focus", ["Complete", "In possession", "Out of possession", "Transitions"])
+    if st.button("Generate match analysis", type="primary", use_container_width=True):
+        generated = generated_match_analysis(events, report_team, report_opponent, analysis_length, analysis_focus)
+        st.session_state.generated_analysis_headings = list(generated)
+        for heading, content in generated.items():
+            st.session_state[f"generated_edit_{heading}"] = content
+        st.session_state["strengths"] = generated.get("Strengths", st.session_state.get("strengths", ""))
+        st.session_state["priorities"] = generated.get("Development priorities", st.session_state.get("priorities", ""))
+        st.session_state["training"] = generated.get("Training recommendations", st.session_state.get("training", ""))
+        st.session_state.pop("report_pdf", None)
+
+    generated_sections = {}
+    if st.session_state.get("generated_analysis_headings"):
+        st.markdown("#### Generated analysis")
+        for heading in st.session_state.generated_analysis_headings:
+            st.markdown(f"**{heading}**")
+            generated_sections[heading] = st.text_area(
+                heading, key=f"generated_edit_{heading}", label_visibility="collapsed",
+                height=100 if analysis_length != "Detailed" else 120,
+            )
+
+    st.markdown("#### Coach inputs")
     match_plan = st.text_area("Match plan and objectives", key="match_plan")
     strengths = st.text_area("Strengths", key="strengths")
     priorities = st.text_area("Development priorities", key="priorities")
     video = st.text_area("Video evidence and timestamps", key="video")
     training = st.text_area("Training response", key="training")
+    include_analysis = st.checkbox("Include generated analysis", value=True,
+                                   disabled=not bool(generated_sections))
     include_shots = st.checkbox("Include shot map", value=True)
     include_network = st.checkbox("Include pass network", value=True)
     if st.button("Prepare PDF report", type="primary"):
@@ -815,16 +1343,34 @@ with tabs[9]:
             f"{home_team} {int(match.home_score)}–{int(match.away_score)} {away_team}", minute_range,
             pdf_summary, pdf_notes,
             {"match_plan": match_plan, "strengths": strengths, "priorities": priorities,
-             "video": video, "training": training}, pdf_figures,
+             "video": video, "training": training,
+             "generated_sections": generated_sections if include_analysis else {}}, pdf_figures,
         )
     if "report_pdf" in st.session_state:
         st.download_button("Download coaching report PDF", st.session_state.report_pdf,
                            f"{match_id}_{report_team}_coaching_report.pdf", "application/pdf")
 
+with tabs[10]:
+    st.subheader("Event data")
+    event_options = sorted(series_or_default(all_events, "type").dropna().astype(str).unique())
+    selected_types = st.multiselect("Event types", event_options, default=event_options)
+    displayed_events = all_events[series_or_default(all_events, "type").isin(selected_types)].copy()
+    display_columns = [column for column in ["minute", "second", "period", "team", "player", "type",
+                                                    "pass_recipient", "pass_outcome", "shot_outcome",
+                                                    "shot_statsbomb_xg", "x", "y", "end_x", "end_y", "notes"]
+                       if column in displayed_events.columns]
+    st.write(f"Showing **{len(displayed_events)}** of **{len(all_events)}** event rows")
+    st.table(format_table(displayed_events[display_columns], hide_index=True))
+    st.download_button("Download normalised event data", displayed_events[display_columns].to_csv(index=False).encode("utf-8"),
+                       f"{match_id}_normalised_events.csv", "text/csv")
+
 with st.expander("Data notes and limitations"):
     st.markdown(
         """
         - StatsBomb open data covers selected competitions and matches rather than every team.
+        - Uploaded files need one row per event for tactical charts. Aggregate reports can still be viewed and downloaded.
+        - Coordinate-based charts require start locations. Passing progression also requires end locations.
+        - Provider exports vary by subscription, software version and tagging setup; review the field and event-name mappings after upload.
         - Possession is estimated from event durations, with possession sequences used as a fallback.
         - Average positions use completed-pass origins; they are not tracking-data positions.
         - A recorded pressure is not the same as a complete measure of pressing intensity.
