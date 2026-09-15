@@ -4,6 +4,10 @@ Match Report Tool is a Streamlit application for analysing football match-event 
 
 The application provides match statistics, pitch graphics, player comparisons, opponent analysis, coaching observations and downloadable PDF reports. It also includes a custom CSV template for teams without an existing event-data provider.
 
+THIS PROJECT CONTAINS A LIVE APPLICATION:
+
+[http://localhost:8501](https://match-report-tool-alohihqbw6v5ewwmta3zoa.streamlit.app/)
+
 Features
 
 StatsBomb open-data match selection
@@ -70,11 +74,8 @@ import sys
 
 !{sys.executable} -m streamlit run app.py
 
-Streamlit will display local and network addresses. Open the local address in a browser, normally:
 
-http://localhost:8501
 
-The notebook cell will remain active while Streamlit is running. Interrupt or stop the cell when you want to close the application.
 
 Test with the fictional match
 
