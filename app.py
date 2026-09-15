@@ -16,6 +16,23 @@ def style_table(df):
         [{'selector': 'th', 'props': [('text-align', 'center')]}]
     )
 
+def style_lineup_table(df):
+    df = df.rename(columns=lambda x: str(x).title())
+    col_widths = {
+        'Squad Number': '80px',
+        'Player': '220px',
+        'Position': '140px',
+        'Status': '130px',
+        'Minutes Played': '110px'
+    }
+    styles = [{'selector': 'th', 'props': [('text-align', 'center')]}]
+    for col, width in col_widths.items():
+        if col in df.columns:
+            idx = df.columns.get_loc(col) + 1
+            styles.append({'selector': f'th.col{idx-1}, td.col{idx-1}',
+                            'props': [('width', width), ('max-width', width)]})
+    return df.style.set_properties(**{'text-align': 'center'}).set_table_styles(styles)
+
 @st.cache_data
 def get_competitions():
     return sb.competitions()
@@ -68,16 +85,20 @@ if st.button("Generate Report"):
     shots = events[events['type'] == 'Shot'].copy()
     shots_by_team = shots.groupby('team').size()
     goals_by_team = shots[shots['shot_outcome'] == 'Goal'].groupby('team').size()
-    xg_by_team = shots.groupby('team')['shot_statsbomb_xg'].sum()
+    xg_by_team = shots.groupby('team')['shot_statsbomb_xg'].sum().round(2)
 
     overview_table = pd.DataFrame({
-        'Possession %': possession_pct.round(1),
+        'Possession %': possession_pct,
         'Shots': shots_by_team,
         'Goals': goals_by_team,
-        'xG': xg_by_team.round(2)
+        'xG': xg_by_team
     }).fillna(0)
+
     overview_table['Goals'] = overview_table['Goals'].astype(int)
     overview_table['Shots'] = overview_table['Shots'].astype(int)
+    overview_table['Possession %'] = overview_table['Possession %'].map('{:.1f}'.format)
+    overview_table['xG'] = overview_table['xG'].map('{:.2f}'.format)
+
     st.table(style_table(overview_table))
 
     st.divider()
@@ -106,9 +127,11 @@ if st.button("Generate Report"):
             if not positions:
                 status = 'Unused Substitute'
                 minutes_played = 0
+                position_name = '-'
             else:
                 starter = any(p.get('start_reason') == 'Starting XI' for p in positions)
                 status = 'Starter' if starter else 'Substitute'
+                position_name = positions[0].get('position', '-')
 
                 first_from = to_minutes(positions[0].get('from'))
                 last_to_raw = positions[-1].get('to')
@@ -119,7 +142,9 @@ if st.button("Generate Report"):
                     minutes_played = max(0, last_to - first_from)
 
             rows.append({
+                'squad number': player['jersey_number'],
                 'player': player['player_name'],
+                'position': position_name,
                 'status': status,
                 'minutes played': minutes_played
             })
@@ -133,10 +158,10 @@ if st.button("Generate Report"):
     col1, col2 = st.columns(2)
     with col1:
         st.write(f"**{home_team}**")
-        st.table(style_table(build_lineup_table(home_team)))
+        st.table(style_lineup_table(build_lineup_table(home_team)))
     with col2:
         st.write(f"**{away_team}**")
-        st.table(style_table(build_lineup_table(away_team)))
+        st.table(style_lineup_table(build_lineup_table(away_team)))
 
     st.divider()
 
